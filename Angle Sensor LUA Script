@@ -1,0 +1,94 @@
+-- File path on the SD card
+local file_path = "/APM/LOGS/Sensor_Log.csv"  -- The log will be saved here
+local file
+
+--P flap look up table
+local p_flap_adc_lookup = {
+    {adc_min = 5900, adc_max = 6100, angle = 0},
+    {adc_min = 4150, adc_max = 4350, angle = 10},
+    {adc_min = 3750, adc_max = 3950, angle = 15},
+    {adc_min = 3400, adc_max = 3600, angle = 20},
+    {adc_min = 400, adc_max = 600, angle = 30}
+}
+
+--s flap look up table
+local s_flap_adc_lookup = {
+    {adc_min = 21100, adc_max = 21850, angle = 0},
+    {adc_min = 18850, adc_max = 19800, angle = 10},
+    {adc_min = 16000, adc_max = 16700, angle = 15},
+    {adc_min = 13750, adc_max = 14650, angle = 20},
+    {adc_min = 9650, adc_max = 10850, angle = 30}
+}
+
+--select a look up table
+local selected_lookup_table = p_flap_adc_lookup  --change to s or p
+
+--calibration equation for values outside look up table
+local function adc_to_angle_equation(adc_value)
+    return (-0.0054*adc_value) + 34.683  --p flap equation
+    --return (-0.0025*adc_value) + 55.409 --s flap equation
+end
+
+--This determines whether to use look up table or equation:
+local function get_angle(adc_value)
+    --if in look up table
+    for _, entry in ipairs(selected_lookup_table) do
+        if adc_value >= entry.adc_min and adc_value <= entry.adc_max then 
+            return entry.angle  --angle directly from look up table
+        end
+    end
+
+    --if not in look up table
+    return adc_to_angle_equation(adc_value)
+end
+
+--Function to read two bytes from Arduino
+local function read_register_data()
+    local bytes = {}
+    bytes[1] = arduino_i2c:read_registers(0) --Read low byte
+    bytes[2] = arduino_i2c:read_registers(1) --Read high byte
+    
+    if not bytes[1] or not bytes[2] then return nil end
+    return bytes
+end
+
+--Function to log data to CSV
+local function log_data(adc_value, angle)
+    file = io.open(file_path, "a")
+
+    if file then
+        file:write(string.format("%d, %.2f\n", adc_value, angle))
+        file:close()
+    else
+        print("Error opening file for logging.")
+    end
+end
+
+--Update function to fetch and send ADC & Angle
+function update()
+    local val = -255  --Default error value
+    local angle = -255  --Default error value
+    local b = read_register_data()
+    
+    if b then
+        val = b[1] | (b[2] << 8)  --Reconstruct ADC value
+        angle = get_angle(val)  --gets angle either from look up table or equation
+    end
+    
+    --Send ADC message
+    gcs:send_named_float('ADC_Value', val)
+    gcs:send_text(MAV_SEVERITY_INFO, string.format("ADC: %d", val))
+
+    --Send Angle message separately
+    gcs:send_named_float('Angle_Value', angle)
+    gcs:send_text(MAV_SEVERITY_INFO, string.format("Angle: %.2f°", angle))
+
+    --Log the data to CSV
+    log_data(val, angle)
+
+    return update, RUN_INTERVAL_MS
+end
+
+gcs:send_text(MAV_SEVERITY_INFO, 'I2C ADC & Angle Reader: Script Active')
+
+return update, RUN_INTERVAL_MS
