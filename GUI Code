@@ -1,0 +1,371 @@
+#Imports
+import tkinter as tk
+from pymavlink import mavutil
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import time
+
+#MAVLink Connection
+def establish_connection():
+    global master
+    master = mavutil.mavlink_connection('COM7')  #udp:0.0.0.0:14550
+    master.wait_heartbeat()
+    print("Connection established with CubePilot")
+establish_connection()
+
+#Arm/Disarm
+def arm_disarm():
+    if arm_button["text"] == "Arm":
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 
+            1, #arm
+            0, 0, 0, 0, 0, 0
+        )
+        arm_button.config(text="Disarm", bg="#e63946")
+        print("System Armed")
+    else:
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0, #disarm
+            0, 0, 0, 0, 0, 0
+        )
+        arm_button.config(text="Arm", bg="#2a9d8f")
+        print("System Disarmed")
+
+#Safety Toggle                                           
+def toggle_safety_switch():
+    try:
+        safety_state = safety_button["text"].startswith("Safety enabled")
+        if safety_state:
+            master.mav.set_mode_send(master.target_system, mavutil.mavlink.MAV_MODE_FLAG_DECODE_POSITION_SAFETY, 0)
+            safety_button.config(text="Safety disabled", bg="#2a9d8f")
+        else:
+            master.mav.set_mode_send(master.target_system, mavutil.mavlink.MAV_MODE_FLAG_DECODE_POSITION_SAFETY, 1)
+            safety_button.config(text="Safety enabled", bg="#e63946")
+    except Exception as e:
+        print(f"Error toggling safety switch: {e}")
+
+#Flight Mode Switching
+def set_mode():
+    selected_mode = mode_var.get()
+    mode_id = master.mode_mapping().get(selected_mode, None)
+    if not mode_id:
+        print(f"Unknown mode: {selected_mode}")
+        return
+    master.mav.set_mode_send(master.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode_id)
+    check_for_ack()
+
+def check_for_ack():
+    ack_msg = master.recv_match(type='COMMAND_ACK', blocking=False)
+    if ack_msg and ack_msg.command == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+        result = mavutil.mavlink.enums['MAV_RESULT'][ack_msg.result].description
+        print(f"Mode change result: {result}")
+    else:
+        root.after(500, check_for_ack)
+
+#servo PWM control
+servo_limits = {
+#channel:(min_PWM, max_PWM)
+    1: (850, 2200),  #aileron
+    2: (1000, 2000),  #elevator
+    4: (500, 2500),  #rudder
+    7: (850, 2200)   #flap
+}
+
+servo_angle_limits = {
+    1: (-30, 30),   #aileron
+    2: (-45, 45),    #elevator
+    4: (-40, 40),   #rudder
+    7: (-30, 0)     #flap
+}
+
+#look up table
+
+elevator_pwm_lookup = {
+    -45: 1635,  
+    -35: 1585,   
+    -25: 1530,  
+    -15: 1470,  
+     0: 1315,  
+    15: 1210,  
+    25: 1140,   
+    35: 1085, 
+    45: 1020   
+}
+
+rudder_pwm_lookup = {
+    -40: 1200,
+    -30: 1300,
+    -20: 1400,  
+    -10: 1465,   
+     0:  1575,  
+    10:  1640, 
+    20:  1925,  
+    30:  2090,  
+    40:  2250  
+}
+
+# p_aileron_pwm_lookup = {
+#     -30:1105,  
+#     -20: 1190, 
+#     -15: 1240, 
+#     -10: 1285, 
+#      -5: 1325,  
+#      0: 1365,  
+#      5: 1425,  
+#     10: 1450,  
+#     15: 1460,  
+#     20: 1512,
+#     30: 1560
+# }
+
+# p_flap_pwm_lookup = {
+#      -30: 1350,
+#      -20: 1445,
+#      -15: 1490,
+#      -10: 1535,
+#      -5: 1570,  
+#       0: 1620  
+#  }
+
+s_aileron_pwm_lookup = {
+    -30: 850,  
+    -20: 1000, 
+    -15: 1065, 
+      0: 1340, 
+     15: 1625,  
+     30: 2200,  
+}
+
+s_flap_pwm_lookup = {
+     -30:1480,
+     -20:1250,
+     -15:1150,
+     -10:1000,
+     -5:850,  
+      0:850  
+ }
+
+#angle assignment to PWM values
+def calibrated_angle_to_pwm(angle, channel):
+    min_pwm, max_pwm = servo_limits.get(channel)
+    #If a value in look up table is requested 
+    if channel == 2:  #elevator
+        lookup_table = elevator_pwm_lookup
+    elif channel == 4:  #rudder
+        lookup_table = rudder_pwm_lookup
+    elif channel == 1:  #aileron - change if p or s
+        lookup_table = s_aileron_pwm_lookup
+    elif channel == 7:  #flap - change if p or s wing
+         lookup_table = s_flap_pwm_lookup
+
+    if angle in lookup_table:
+        return lookup_table[angle]
+
+    #If a value is not in the look up table is requested
+    if channel == 2:                                 #elevator calibration
+        pwm_value = (-7.1738*angle)+1332.2  
+    elif channel == 4:                               #rudder calibration
+        pwm_value = (10.083*angle)+1586.7 
+    elif channel == 1:                              #aileron calibration
+        #pwm_value = (7.7394*angle)+1356.1                #p wing
+        pwm_value = 0.2302*angle**2 +21.5386*angle+1316.7901  #s wing
+    elif channel == 7:                              #flap calibration
+        #pwm_value = (8.8857*angle)+1620.1                #p wing
+        pwm_value = -0.2327*angle**2 -33.1576*angle + 692.2680  #s wing
+    else:
+        #Use default linear mapping for other servos
+        angle_min, angle_max = servo_angle_limits.get(channel)
+        pwm_value = min_pwm + (angle - angle_min) * (max_pwm - min_pwm) / (angle_max - angle_min)
+
+    return int(max(min_pwm, min(max_pwm, pwm_value)))  #ensure PWM stays in range
+
+#only sends angle command if armed    #just reminds me to arm
+def send_servo_command(channel, pwm_value):
+    if arm_button["text"] == "Disarm":
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+            0, channel, pwm_value, 0, 0, 0, 0, 0
+        )
+#Update servo angle in real-time from toggle
+def update_servo_angle(channel, angle):
+    pwm_value = calibrated_angle_to_pwm(angle, channel)
+    send_servo_command(channel, pwm_value)
+
+#update servo angle in real time from entry box
+def update_servo_from_entry(channel, entry, slider):
+    try:
+        angle = int(entry.get())
+        if -45 <= angle <= 45:
+            update_servo_angle(channel, angle)
+            slider.set(angle)
+    except ValueError:
+        print("Invalid input. Please enter a number.")
+
+#flap angle set to specific deployments     
+def set_flap_angle(angle):
+    global flap_slider
+    print(f"Setting flap angle to {angle}°")
+    update_servo_angle(7, angle)
+    flap_slider.set(angle)    #also updates slider angle
+    root.update_idletasks()
+
+#Graph Setup
+time_data = []
+angle_data = []
+start_time = time.time()
+logging_active = False #starts with logging off
+
+#ON/OFF toggle for data logging
+def toggle_logging():
+    global logging_active
+    logging_active = not logging_active
+    log_button.config(text="Stop Logging" if logging_active else "Start Logging", bg="#e63946" if logging_active else "#2a9d8f")
+
+#Real time and angle graph for flap
+def record_flap_angle(angle):
+    if logging_active:
+        current_time = time.time() - start_time
+        time_data.append(current_time)
+        angle_data.append(angle)
+        if len(time_data) > 500:  #keeps the last 500 data points on the graph at all times
+            time_data.pop(0)
+            angle_data.pop(0)
+
+#Graph layout
+fig, ax = plt.subplots(figsize=(8, 5))
+fig.patch.set_facecolor("#d3d3d3")  #Match UI background
+ax.set_facecolor("#d3d3d3")  #Set plot background
+line, = ax.plot([], [], 'b-', label="S Flap Angle")
+ax.set_xlabel("Time (s)", fontsize=10)
+ax.set_ylabel("Flap Angle (°)", fontsize=10)
+ax.set_xlim(0, 10)
+ax.set_ylim(0,30)
+ax.grid(True, linestyle="--", alpha=0.6)  #transparent grid
+
+#Update plot
+def update_plot():
+    if time_data:
+        line.set_data(time_data, angle_data)
+        ax.set_xlim(max(0, time_data[-1] - 10), time_data[-1]) #time axis scrolling
+        ax.figure.canvas.draw()
+
+#Periodic update
+def periodic_update():      #graph even if servo angle doesn't change
+    global flap_angle
+    #Try to receive the "Angle_Value" message from MAVLink
+    msg = master.recv_match(type='NAMED_VALUE_FLOAT', blocking=False)
+    if msg and msg.name == b'Angle_Value':  #Checks if it's the flap angle message
+        flap_angle = msg.value  #Stores the received angle
+        flap_angle = max(30, min(0, flap_angle))   #Ensures the angle is 0 to 30
+        print(f"Received Flap Angle from Sensor: {flap_angle}°")  #Debugging output
+        record_flap_angle(flap_angle)   #Record the received angle for real-time plotting
+    update_plot()  #Refreshs the graph with new data
+    root.after(100, periodic_update)  #Repeats every 100ms for faster updates
+
+#Main Window Setup
+root = tk.Tk()
+root.title("AVDASI2 Albatross")
+root.geometry("1200x900")
+root.config(bg="#d3d3d3")
+
+#USERINTERFACE(UI):
+
+canvas = FigureCanvasTkAgg(fig, master=root)
+canvas.get_tk_widget().grid(row=0, column=0, padx=10, pady=(10, 20), columnspan=3, sticky="nsew")
+
+#control Buttons
+controls_frame = tk.Frame(root, bg="#d3d3d3")
+controls_frame.grid(row=1, column=0, columnspan=3, pady=(5, 20))
+
+arm_button = tk.Button(controls_frame, text="Arm", command=arm_disarm, bg="#2a9d8f", fg="white", font=("Arial", 14), width=15)
+arm_button.grid(row=0, column=0, padx=10, pady=5)
+
+safety_button = tk.Button(controls_frame, text="Enable Safety", command=toggle_safety_switch, bg="#2a9d8f", fg="white", font=("Arial", 14), width=15)
+safety_button.grid(row=0, column=1, padx=10, pady=5)
+
+log_button = tk.Button(controls_frame, text="Start Logging", command=toggle_logging, bg="#2a9d8f", fg="white", font=("Arial", 14), width=15)
+log_button.grid(row=0, column=2, padx=10, pady=5)
+
+servo_controls_frame = tk.Frame(root, bg="#d3d3d3")
+servo_controls_frame.grid(row=2, column=0, padx=100, pady=10, sticky="nsew")
+
+servo_control_label = tk.Label(servo_controls_frame, text="Servo Angle Deflections", font=("Arial", 14), bg="#d3d3d3", fg="#1d3557")
+servo_control_label.grid(row=0, column=0, columnspan=2, pady=10)
+
+#elevator Control
+tk.Label(servo_controls_frame, text="Elevator Angle", bg="#f1faee", fg="#1d3557").grid(row=1, column=0, sticky="w")
+elevator_slider = tk.Scale(servo_controls_frame, from_=-45, to=45, orient="horizontal",
+                           command=lambda val: update_servo_angle(2, int(val)))
+elevator_slider.grid(row=1, column=1, sticky="ew")
+elevator_entry = tk.Entry(servo_controls_frame)
+elevator_entry.grid(row=1, column=2, sticky="ew")
+elevator_entry.bind("<Return>", lambda event: update_servo_from_entry(2, elevator_entry, elevator_slider))
+
+#rudder Control
+tk.Label(servo_controls_frame, text="Rudder Angle", bg="#f1faee", fg="#1d3557").grid(row=2, column=0, sticky="w")
+rudder_slider = tk.Scale(servo_controls_frame, from_=-40, to=40, orient="horizontal",
+                         command=lambda val: update_servo_angle(4, int(val)))
+rudder_slider.grid(row=2, column=1, sticky="ew")
+rudder_entry = tk.Entry(servo_controls_frame)
+rudder_entry.grid(row=2, column=2, sticky="ew")
+rudder_entry.bind("<Return>", lambda event: update_servo_from_entry(4, rudder_entry, rudder_slider))
+
+#aileron Control
+tk.Label(servo_controls_frame, text="Aileron Angle", bg="#f1faee", fg="#1d3557").grid(row=3, column=0, sticky="w")
+aileron_slider = tk.Scale(servo_controls_frame, from_=-30, to=30, orient="horizontal",
+                          command=lambda val: update_servo_angle(1, int(val)))
+aileron_slider.grid(row=3, column=1, sticky="ew")
+aileron_entry = tk.Entry(servo_controls_frame)
+aileron_entry.grid(row=3, column=2, sticky="ew")
+aileron_entry.bind("<Return>", lambda event: update_servo_from_entry(1, aileron_entry, aileron_slider))
+
+#flap Control
+tk.Label(servo_controls_frame, text="Flap Angle", bg="#f1faee", fg="#1d3557").grid(row=4, column=0, sticky="w")
+flap_slider = tk.Scale(servo_controls_frame, from_=-30, to=0, orient="horizontal",
+                       command=lambda val: update_servo_angle(7, int(val)))
+flap_slider.grid(row=4, column=1, sticky="ew")
+flap_entry = tk.Entry(servo_controls_frame)
+flap_entry.grid(row=4, column=2, sticky="ew")
+flap_entry.bind("<Return>", lambda event: update_servo_from_entry(7, flap_entry, flap_slider))
+
+#flap Deployment
+flap_controls_frame = tk.Frame(root, bg="#d3d3d3")
+flap_controls_frame.grid(row=2, column=1, padx=10, pady=10)
+
+flap_control_label = tk.Label(flap_controls_frame, text="Flap Deployment:", font=("Arial", 14, "bold"), bg="#d3d3d3", fg="#1d3557")
+flap_control_label.grid(row=0, column=0, columnspan=3, pady=(0, 10))
+
+cruise_button = tk.Button(flap_controls_frame, text="Cruise 0°", command=lambda: set_flap_angle(0), font=("Arial", 12))
+cruise_button.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
+
+takeoff_button = tk.Button(flap_controls_frame, text="Takeoff -15°", command=lambda: set_flap_angle(-15), font=("Arial", 12))
+takeoff_button.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+
+landing_button = tk.Button(flap_controls_frame, text="Landing -30°", command=lambda: set_flap_angle(-30), font=("Arial", 12))
+landing_button.grid(row=1, column=2, padx=5, pady=5, sticky="ew")
+
+#Mode Selection
+mode_var = tk.StringVar(root)
+mode_var.set("STABILIZE")
+mode_label = tk.Label(root, text="Flight Mode:", font=("Arial", 12), bg="#d3d3d3", fg="#1d3557")
+mode_label.grid(row=3, column=0, sticky="w", padx=10, pady=10)
+mode_menu = tk.OptionMenu(root, mode_var, "STABILIZE", "MANUAL",)
+mode_menu.grid(row=3, column=1, sticky="ew", padx=10, pady=10)
+mode_button = tk.Button(root, text="Set Mode", command=set_mode, bg="#457b9d", fg="white", font=("Arial", 14))
+mode_button.grid(row=3, column=2, padx=10, pady=10, sticky="nsew")
+
+#Configure Layout
+root.grid_rowconfigure(0, weight=1)
+root.grid_columnconfigure(0, weight=1)
+
+root.after(500, periodic_update)
+root.mainloop()
